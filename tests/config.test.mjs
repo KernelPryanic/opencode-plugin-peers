@@ -17,7 +17,7 @@ test("resolveConfig applies defaults", () => {
   assert.equal(cfg.inboundPolicy, "accept")
   assert.equal(cfg.peerPermissions, "allow")
   assert.equal(cfg.heartbeatMs, 10_000)
-  assert.equal(cfg.staleMs, 30_000)
+  assert.equal(cfg.staleMs, 60_000)
   assert.equal(cfg.maxQueue, 50)
   assert.equal(cfg.maxHeld, 100)
   assert.equal(cfg.maxMessageBytes, 8192)
@@ -54,6 +54,12 @@ test("validateName accepts safe names and rejects dangerous ones", () => {
   assert.match(validateName("bad\nname"), /1-32/)
   assert.match(validateName("quote\"name"), /1-32/)
   assert.match(validateName("emoji🤖"), /1-32/)
+  // raw session ids are now endpoint ids; names must not be mistakable for them
+  assert.match(validateName("ses_abc123"), /must not start with/)
+  assert.match(validateName("session-alpha"), /must not start with/)
+  assert.match(validateName("workspace-9f2c"), /must not start with/)
+  assert.equal(validateName("sessional"), null)
+  assert.equal(validateName("workspaceless"), null)
 })
 
 test("defaultPeerName: appends instanceId hex suffix to directory basename", () => {

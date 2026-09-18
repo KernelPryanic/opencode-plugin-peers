@@ -43,7 +43,7 @@ export function resolveConfig(
     inboundPolicy: opts?.inboundPolicy ?? "accept",
     peerPermissions: opts?.peerPermissions ?? "allow",
     heartbeatMs: opts?.heartbeatMs ?? 10_000,
-    staleMs: opts?.staleMs ?? 30_000,
+    staleMs: opts?.staleMs ?? 60_000,
     maxQueue: opts?.maxQueue ?? 50,
     maxHeld: opts?.maxHeld ?? 100,
     maxMessageBytes: opts?.maxMessageBytes ?? 8192,
@@ -56,10 +56,14 @@ export function resolveConfig(
 }
 
 const NAME_RE = /^[A-Za-z0-9 _-]{1,32}$/
+const RESERVED_NAME_PREFIXES = ["ses_", "session-", "workspace-"]
 
 export function validateName(name: string): string | null {
   if (!NAME_RE.test(name)) {
     return "Name must be 1-32 chars of [A-Za-z0-9 _-] (no newlines or symbols)."
+  }
+  if (RESERVED_NAME_PREFIXES.some((prefix) => name.startsWith(prefix))) {
+    return "Name must not start with ses_, session-, or workspace- (reserved for endpoint IDs)."
   }
   return null
 }

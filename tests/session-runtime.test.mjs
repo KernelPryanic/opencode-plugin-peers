@@ -4,7 +4,7 @@ import { mkdir, mkdtemp, readdir, readFile, rename, rm } from "node:fs/promises"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 import { resolveConfig } from "../dist/config.js"
-import { MessageQueue, createSessionMessageQueue, stableSessionEndpointId, stableSpoolEndpointId } from "../dist/queue.js"
+import { MessageQueue, createSessionMessageQueue, stableSpoolEndpointId } from "../dist/queue.js"
 import { SessionRuntime } from "../dist/session-runtime.js"
 import { PeersPlugin } from "../dist/index.js"
 import { Sender } from "../dist/sender.js"
@@ -76,15 +76,17 @@ test("session runtime adopts only live sessions at startup, then discovers by ev
     let endpoints = runtime.registryEndpoints()
     assert.deepEqual(endpoints.map((entry) => entry.sessionId), ["ses_two"])
 
-    // Event-driven adoption: an update adopts a historical session...
+    // Event-driven adoption: a recently-updated session joins via events
+    // (replayed ancient history stays out — covered by its own test)...
+    const now = Date.now()
     await runtime.handleEvent({
       type: "session.updated",
-      properties: { info: session("ses_one") },
+      properties: { info: session("ses_one", { time: { created: now - 10_000, updated: now - 1_000 } }) },
     })
     // ...and creating a session also discovers its children.
     await runtime.handleEvent({
       type: "session.created",
-      properties: { info: session("ses_child", { parentID: "ses_one", time: { created: 150, updated: 250 } }) },
+      properties: { info: session("ses_child", { parentID: "ses_one", time: { created: now - 800, updated: now - 500 } }) },
     })
     endpoints = runtime.registryEndpoints()
     assert.equal(endpoints.length, 3)
@@ -92,7 +94,7 @@ test("session runtime adopts only live sessions at startup, then discovers by ev
     assert.ok(endpoints.every((entry) => entry.name === "project"))
     assert.ok(endpoints.some((entry) => entry.sessionId === "ses_child" && entry.parentSessionId === "ses_one"))
 
-    const targetId = stableSessionEndpointId("ses_two")
+    const targetId = "ses_two"
     assert.equal(await runtime.receive(message("busy-1"), targetId, "accept"), "delivered")
     assert.equal(await runtime.receive(message("busy-2"), targetId, "accept"), "delivered")
     assert.deepEqual(client.prompts.map((call) => call.path.id), ["ses_two", "ses_two"])
@@ -107,7 +109,7 @@ test("session runtime adopts only live sessions at startup, then discovers by ev
 
     await runtime.handleEvent({
       type: "session.created",
-      properties: { info: session("ses_three", { time: { created: 600, updated: 600 } }) },
+      properties: { info: session("ses_three", { time: { created: now, updated: now } }) },
     })
     await runtime.handleEvent({
       type: "session.status",
@@ -146,8 +148,15 @@ test("plugin exposes same-process sessions and uses tool context sessionID as se
     // Only the startup-busy session (ses_two) is adopted by deferred
     // discovery. The others join through real activity, as in production:
     // a user message adopts ses_one; a created event adopts the child.
+    const now = Date.now()
+    const originalGet = client.session.get.bind(client.session)
+    client.session.get = async (args) => ({
+      data: args.path.id === "ses_one"
+        ? session("ses_one", { time: { created: now - 9_000, updated: now - 1_000 } })
+        : (await originalGet(args)).data,
+    })
     await hooks["chat.message"]({ sessionID: "ses_one" })
-    await hooks.event({ event: { type: "session.created", properties: { info: session("ses_child", { parentID: "ses_one", time: { created: 150, updated: 250 } }) } } })
+    await hooks.event({ event: { type: "session.created", properties: { info: session("ses_child", { parentID: "ses_one", time: { created: now - 800, updated: now - 500 } }) } } })
 
     for (let attempt = 0; attempt < 50; attempt++) {
       const files = await readdir(join(storageDir, "peers.d"))
@@ -170,13 +179,11 @@ test("plugin exposes same-process sessions and uses tool context sessionID as se
     assert.deepEqual(legacyResult, { ok: true, status: "delivered" })
     assert.equal(client.prompts.at(-1).path.id, "ses_one")
 
-    const senderId = stableSessionEndpointId("ses_one")
-    const targetId = stableSessionEndpointId("ses_two")
+    const senderId = "ses_one"
+    const targetId = "ses_two"
     const context = { sessionID: "ses_one" }
     const listing = await hooks.tool.list_agents.execute({}, context)
-    // list_agents collapses to one row per process; ses_one/ses_two/ses_child
-    // are all the same process, so only one endpoint id appears (not senderId
-    // since that is the self endpoint filtered out).
+    // one row per endpoint; the self endpoint (ses_one) is filtered out
     assert.doesNotMatch(listing, new RegExp(`- .*${senderId}`))
     // send_message targeting by exact endpoint id still resolves to the
     // full (un-collapsed) registry — tested below.
@@ -231,7 +238,7 @@ test("runtime migrates the Task 1 workspace spool to the compatibility root sess
   try {
     const config = resolveConfig({ storageDir })
     const workspaceId = stableSpoolEndpointId("/workspace/project")
-    const targetId = stableSessionEndpointId("ses_two")
+    const targetId = "ses_two"
     const source = MessageQueue({
       endpointId: workspaceId,
       maxQueue: config.maxQueue,
@@ -290,7 +297,7 @@ test("workspace spool migration resumes partial moves and quarantines visible co
   try {
     const config = resolveConfig({ storageDir })
     const workspaceId = stableSpoolEndpointId("/workspace/project")
-    const targetId = stableSessionEndpointId("ses_two")
+    const targetId = "ses_two"
     const source = MessageQueue({
       endpointId: workspaceId,
       maxQueue: config.maxQueue,
@@ -398,8 +405,8 @@ test("startup adopts busy children directly from the status snapshot; deletes ca
     )
     assert.equal(runtime.registryEndpoints().find((entry) => entry.sessionId === child.id).status, "busy")
     assert.equal(runtime.registryEndpoints().find((entry) => entry.sessionId === grandchild.id).status, "retry")
-    assert.equal(await runtime.receive(message("busy-child"), stableSessionEndpointId(child.id), "accept"), "delivered")
-    assert.equal(await runtime.receive(message("retry-child"), stableSessionEndpointId(grandchild.id), "accept"), "delivered")
+    assert.equal(await runtime.receive(message("busy-child"), child.id, "accept"), "delivered")
+    assert.equal(await runtime.receive(message("retry-child"), grandchild.id, "accept"), "delivered")
     assert.deepEqual(prompts.map((call) => call.path.id), [child.id, grandchild.id])
 
     // deleting the (unadopted) root still cascades to its adopted descendants
@@ -430,7 +437,7 @@ test("stopped runtime rejects late events, activity, receives, and sweeps", asyn
       properties: { info: session("ses_after_stop", { time: { created: 900, updated: 900 } }) },
     }), false)
     await runtime.noteActivity("ses_one")
-    assert.equal(await runtime.receive(message("after-stop"), stableSessionEndpointId("ses_two"), "accept"), "dropped")
+    assert.equal(await runtime.receive(message("after-stop"), "ses_two", "accept"), "dropped")
     await runtime.sweep()
     assert.deepEqual(runtime.registryEndpoints().map((entry) => entry.sessionId).sort(), before)
     assert.equal(client.prompts.length, 0)
@@ -468,9 +475,10 @@ test("plugin disposal waits for an in-flight event and never republishes registr
       sweepMs: 60_000,
     })
 
+    const now = Date.now()
     const inFlight = hooks.event({ event: {
       type: "session.created",
-      properties: { info: session("ses_late", { time: { created: 800, updated: 800 } }) },
+      properties: { info: session("ses_late", { time: { created: now, updated: now } }) },
     } })
     await lateStarted
     const disposing = hooks.dispose()
@@ -588,6 +596,135 @@ test("startup adopts an idle session that holds undelivered spool records", asyn
     assert.deepEqual(adopted, ["ses_one", "ses_two"]) // spool holder + busy snapshot
     // ...and the queued message is delivered without waiting for any event
     assert.ok(client.prompts.some((call) => call.path.id === "ses_one"))
+  } finally {
+    await rm(storageDir, { recursive: true, force: true })
+  }
+})
+
+test("sweep adopts busy/recent foreign sessions, idles unseen locals, deletes quiet foreigns", async () => {
+  const storageDir = await mkdtemp(join(tmpdir(), "peers-session-sweep-"))
+  try {
+    const now = Date.now()
+    const sessions = new Map([
+      ["ses_mine", session("ses_mine", { time: { created: 100, updated: now - 1_000 } })],
+      // recently updated but idle -> adopted by the sweep, never by initialize
+      ["ses_recent", session("ses_recent", { time: { created: 100, updated: now - 1_000 } })],
+      // busy subagent that appears ONLY in the status snapshot; its
+      // time.updated is already old, so once it goes quiet it must be deleted
+      ["ses_ghost", session("ses_ghost", { parentID: "ses_recent", time: { created: 100, updated: now - 10 * 60_000 } })],
+      // historical idle session in another directory -> never adopted
+      ["ses_far", session("ses_far", { directory: "/elsewhere", time: { created: 100, updated: 100 } })],
+    ])
+    let listed = ["ses_mine", "ses_recent", "ses_far"]
+    let statuses = { ses_mine: { type: "busy" } }
+    const getCalls = []
+    const client = {
+      session: {
+        list: async () => ({ data: listed.map((id) => sessions.get(id)) }),
+        status: async () => ({ data: statuses }),
+        get: async ({ path }) => {
+          getCalls.push(path.id)
+          return { data: sessions.get(path.id) }
+        },
+        children: async () => ({ data: [] }),
+        promptAsync: async () => ({ data: undefined }),
+      },
+    }
+    const runtime = SessionRuntime({
+      client,
+      config: resolveConfig({ storageDir }),
+      directory: "/workspace/project",
+      name: () => "project",
+      logger: noopLogger,
+    })
+    await runtime.initialize()
+    assert.deepEqual(runtime.registryEndpoints().map((e) => e.sessionId), ["ses_mine"])
+
+    // sweep #1: adopts the recently-updated same-directory session as foreign
+    await runtime.sweep()
+    assert.deepEqual(
+      runtime.registryEndpoints().map((e) => e.sessionId).sort(),
+      ["ses_mine", "ses_recent"]
+    )
+    assert.deepEqual(getCalls, [])
+
+    // sweep #2: a busy session found only in the status snapshot is adopted
+    // via client.session.get
+    statuses = { ses_mine: { type: "busy" }, ses_ghost: { type: "busy" } }
+    await runtime.sweep()
+    assert.deepEqual(getCalls, ["ses_ghost"])
+    const ghost = runtime.registryEndpoints().find((e) => e.sessionId === "ses_ghost")
+    assert.equal(ghost.status, "busy")
+    assert.equal(ghost.parentSessionId, "ses_recent")
+
+    // event-adopted endpoints: same directory (slash/backslash agnostic) and
+    // a busy endpoint in another directory
+    await runtime.handleEvent({
+      type: "session.updated",
+      properties: { info: session("ses_event", { directory: "\\workspace\\project\\", time: { created: 100, updated: now - 500 } }) },
+    })
+    await runtime.handleEvent({
+      type: "session.updated",
+      properties: { info: session("ses_far_busy", { directory: "/elsewhere", time: { created: 100, updated: now - 500 } }) },
+    })
+    await runtime.noteActivity("ses_event")
+    await runtime.noteActivity("ses_far_busy")
+
+    // sweep #3: the ghost stops being busy and disappears from the listing
+    // (empty queue, no held messages, no pending ACKs -> deleted); the unseen
+    // local is idled out; the unseen other-directory endpoint is untouched
+    statuses = { ses_mine: { type: "busy" } }
+    listed = ["ses_mine", "ses_recent", "ses_far"]
+    await runtime.sweep()
+    const endpoints = runtime.registryEndpoints()
+    assert.deepEqual(
+      endpoints.map((e) => e.sessionId).sort(),
+      ["ses_event", "ses_far_busy", "ses_mine", "ses_recent"]
+    )
+    assert.equal(endpoints.find((e) => e.sessionId === "ses_event").status, "idle")
+    assert.equal(endpoints.find((e) => e.sessionId === "ses_far_busy").status, "busy")
+    assert.deepEqual(getCalls, ["ses_ghost"])
+  } finally {
+    await rm(storageDir, { recursive: true, force: true })
+  }
+})
+
+test("replayed historical session events and lookups do not create endpoints", async () => {
+  const storageDir = await mkdtemp(join(tmpdir(), "peers-session-history-"))
+  try {
+    const now = Date.now()
+    const fresh = session("ses_now", { time: { created: now - 5_000, updated: now - 1_000 } })
+    const client = {
+      session: {
+        list: async () => ({ data: [] }),
+        status: async () => ({ data: {} }),
+        get: async ({ path }) => ({ data: path.id === "ses_now" ? fresh : session(path.id) }),
+        children: async () => ({ data: [] }),
+        promptAsync: async () => ({ data: undefined }),
+      },
+    }
+    const runtime = SessionRuntime({
+      client,
+      config: resolveConfig({ storageDir }),
+      directory: "/workspace/project",
+      name: () => "project",
+      logger: noopLogger,
+    })
+    await runtime.initialize()
+    assert.deepEqual(runtime.registryEndpoints().map((e) => e.sessionId), [])
+
+    // opencode replays historical sessions' created/updated events at startup
+    await runtime.handleEvent({ type: "session.created", properties: { info: session("ses_hist_1") } })
+    await runtime.handleEvent({ type: "session.updated", properties: { info: session("ses_hist_2") } })
+    assert.deepEqual(runtime.registryEndpoints().map((e) => e.sessionId), [])
+
+    // a stale lookup (noteActivity -> findSession -> session.get) stays out too
+    await runtime.noteActivity("ses_hist_3")
+    assert.deepEqual(runtime.registryEndpoints().map((e) => e.sessionId), [])
+
+    // fresh activity still adopts
+    await runtime.handleEvent({ type: "session.created", properties: { info: fresh } })
+    assert.deepEqual(runtime.registryEndpoints().map((e) => e.sessionId), ["ses_now"])
   } finally {
     await rm(storageDir, { recursive: true, force: true })
   }

@@ -158,7 +158,7 @@ export interface PluginConfig {
   peerPermissions?: PeerPermissionMode
   /** Heartbeat interval ms. Default 10_000. */
   heartbeatMs?: number
-  /** A peer is stale if its heartbeat is older than this. Default 30_000. */
+  /** A peer is stale if its heartbeat is older than this. Default 60_000. */
   staleMs?: number
   /** Max queued messages awaiting an immediate-delivery retry. Default 50. */
   maxQueue?: number

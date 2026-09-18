@@ -46,11 +46,6 @@ export function stableSpoolEndpointId(directory: string): string {
   return `workspace-${digest.slice(0, 24)}`
 }
 
-export function stableSessionEndpointId(sessionId: string): string {
-  const digest = createHash("sha256").update(`session-v1\0${sessionId}`).digest("hex")
-  return `session-${digest.slice(0, 24)}`
-}
-
 /**
  * True when the session's durable spool holds any records — undelivered
  * (queued/held/inflight) or delivered (done, retained 24h for dedupe).
@@ -59,7 +54,7 @@ export function stableSessionEndpointId(sessionId: string): string {
  * deliver a duplicate. Everything else stays unpublished until real activity.
  */
 export function hasSpoolRecords(config: ResolvedConfig, sessionId: string): boolean {
-  const spoolDir = join(config.spoolDir, stableSessionEndpointId(sessionId))
+  const spoolDir = join(config.spoolDir, sessionId)
   for (const state of ["queued", "held", "inflight", "done"] as const) {
     try {
       if (readdirSync(join(spoolDir, state)).some((file) => file.endsWith(".json"))) return true
@@ -76,7 +71,7 @@ export function createSessionMessageQueue(opts: {
   logger: Logger
 }): QueueInstance {
   return MessageQueue({
-    endpointId: stableSessionEndpointId(opts.sessionId),
+    endpointId: opts.sessionId,
     maxQueue: opts.config.maxQueue,
     maxHeld: opts.config.maxHeld,
     heldExpiryMs: opts.config.heldExpiryMs,
@@ -230,7 +225,7 @@ export async function migrateWorkspaceSpool(opts: {
   logger: Logger
 }): Promise<SpoolMigrationResult> {
   const sourceEndpointId = stableSpoolEndpointId(opts.directory)
-  const targetEndpointId = stableSessionEndpointId(opts.targetSessionId)
+  const targetEndpointId = opts.targetSessionId
   const result: SpoolMigrationResult = {
     migrated: 0,
     deduplicated: 0,

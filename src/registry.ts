@@ -165,7 +165,7 @@ export function Registry(opts: RegistryOptions): RegistryInstance {
       serverUrl: opts.serverUrl,
       inboxUrl: opts.inboxUrl,
       inboxToken: opts.inboxToken,
-      capabilities: ["local", "protocol-v2", "prompt-async", "ack"],
+      capabilities: ["local", "protocol-v2", "prompt-async", "ack", "raw-session-ids"],
       timestamps: {
         startedAt: endpoint.startedAt,
         updatedAt: endpoint.updatedAt,
@@ -335,11 +335,21 @@ export function Registry(opts: RegistryOptions): RegistryInstance {
       const now = Date.now()
       let removed = 0
       for (const file of files) {
-        if (!file.endsWith(".json")) continue
         const path = join(opts.peersDir, file)
         if (path === selfFile || selfV2Files.has(path)) continue
         try {
           const st = await stat(path)
+          if (file.endsWith(".tmp")) {
+            if (now - st.mtimeMs >= 5 * 60_000) {
+              const match = /\.(\d+)\.tmp$/.exec(file)
+              const writerPid = match ? Number(match[1]) : null
+              if (writerPid !== null && pidAlive(writerPid)) continue
+              await rm(path, { force: true })
+              removed++
+            }
+            continue
+          }
+          if (!file.endsWith(".json")) continue
           if (now - st.mtimeMs < 5 * 60_000) continue
           const entry = await readEntry(file)
           if (entry && pidAlive(entry.pid)) continue

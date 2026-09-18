@@ -33,13 +33,10 @@ test("production queue construction reuses a stable spool across restarts", asyn
   }
 })
 
-test("session endpoint ids are stable per OpenCode session and isolate same-directory spools", async () => {
+test("session endpoint ids isolate same-directory spools", async () => {
   const dir = await mkdtemp(join(tmpdir(), "peers-runtime-queue-"))
   try {
     const config = resolveConfig({ storageDir: dir })
-    const firstId = peers.stableSessionEndpointId("ses_alpha")
-    assert.equal(firstId, peers.stableSessionEndpointId("ses_alpha"))
-    assert.notEqual(firstId, peers.stableSessionEndpointId("ses_beta"))
 
     const alpha = peers.createSessionMessageQueue({ config, sessionId: "ses_alpha", logger: noopLogger })
     const beta = peers.createSessionMessageQueue({ config, sessionId: "ses_beta", logger: noopLogger })
@@ -49,7 +46,7 @@ test("session endpoint ids are stable per OpenCode session and isolate same-dire
     const restartedAlpha = peers.createSessionMessageQueue({ config, sessionId: "ses_alpha", logger: noopLogger })
     await restartedAlpha.loadHeld()
     assert.deepEqual(restartedAlpha.pending().map((entry) => entry.id), ["alpha-only"])
-    assert.equal((await readdir(join(dir, "spool"))).length, 2)
+    assert.deepEqual((await readdir(join(dir, "spool"))).sort(), ["ses_alpha", "ses_beta"])
   } finally {
     await rm(dir, { recursive: true, force: true })
   }

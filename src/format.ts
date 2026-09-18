@@ -13,6 +13,16 @@
 
 import type { ListedPeer } from "./registry.js"
 
+/** Case/slash-insensitive directory equality, folding case only where the platform does. */
+export function sameDirectory(a: string, b: string): boolean {
+  const normalize = (path: string) => {
+    let out = path.replace(/\\/g, "/").replace(/\/+$/, "")
+    if (process.platform === "win32" || process.platform === "darwin") out = out.toLowerCase()
+    return out
+  }
+  return normalize(a) === normalize(b)
+}
+
 /** "just now" | "9m ago" | "2h ago" | "3d ago" */
 export function relativeAge(since: number, now: number): string {
   const secs = Math.max(0, Math.round((now - since) / 1000))
@@ -34,44 +44,30 @@ function entryKey(peer: ListedPeer): string {
   return peer.entry.version === 2 ? peer.entry.endpointId : peer.entry.instanceId
 }
 
-/** The process identifier — v2 entries share a processId, v1 entries use instanceId. */
-function processKey(peer: ListedPeer): string {
-  return peer.entry.version === 2 ? peer.entry.processId : peer.entry.instanceId
+function lastActive(peer: ListedPeer): number {
+  // v1 entries have no updatedAt; heartbeatAt ticks every heartbeat, which
+  // would reshuffle the list constantly, so fall back to the static start.
+  return peer.entry.version === 2 ? peer.entry.timestamps.updatedAt : peer.entry.startedAt
+}
+
+function subagentTag(peer: ListedPeer): string | null {
+  return peer.entry.version === 2 && peer.entry.parentSessionId ? "[subagent]" : null
 }
 
 /**
- * Collapse multiple session endpoints of the same process into one display
- * row — the most recently active session. opencode persists every session
- * a directory ever had and replays their events at startup, so per-session
- * rows would flood /peers with historical sessions. One row per running
- * process matches Claude Code's instance list. Routing (send_message) still
- * targets individual endpoint IDs from the full registry.
- */
-export function collapseToProcesses<T extends ListedPeer>(peers: T[]): T[] {
-  const byProcess = new Map<string, T>()
-  for (const peer of peers) {
-    const key = processKey(peer)
-    const current = byProcess.get(key)
-    if (!current || peer.entry.startedAt > current.entry.startedAt) {
-      byProcess.set(key, peer)
-    }
-  }
-  return [...byProcess.values()]
-}
-
-/**
- * Deterministic display order. The registry rewrites entries with atomic
- * renames every heartbeat, so readdir order shuffles constantly — sorting
- * here keeps /peers output stable between invocations.
+ * Deterministic display order: most recently active first, so busy peers and
+ * fresh subagents surface at the top. The registry rewrites entries with
+ * atomic renames every heartbeat, so readdir order shuffles constantly —
+ * sorting here keeps output stable between invocations.
  */
 export function sortPeers<T extends ListedPeer>(peers: T[]): T[] {
   return peers.slice().sort((a, b) =>
-    a.entry.startedAt - b.entry.startedAt || entryKey(a).localeCompare(entryKey(b))
+    lastActive(b) - lastActive(a) || entryKey(a).localeCompare(entryKey(b))
   )
 }
 
 export function formatSessionList(peers: ListedPeer[], now: number): string {
-  const online = sortPeers(collapseToProcesses(peers.filter((p) => p.alive)))
+  const online = sortPeers(peers.filter((p) => p.alive))
   const offline = peers.filter((p) => !p.alive)
   const lines: string[] = []
 
@@ -86,8 +82,10 @@ export function formatSessionList(peers: ListedPeer[], now: number): string {
         : null
       const segments = [
         p.entry.name,
+        ...(subagentTag(p) ? [subagentTag(p)!] : []),
         ...(titleSeg ? [titleSeg] : []),
         p.entry.directory,
+        entryKey(p),
         `started ${relativeAge(p.entry.startedAt, now)}`,
       ]
       const queued = p.entry.queuedCount ?? 0

@@ -87,6 +87,109 @@ test("formatPeerList renders empty state", () => {
   assert.match(out, /No peers online/)
 })
 
+const NOW = Date.now()
+
+function v2Entry(over = {}) {
+  return {
+    version: 2,
+    endpointId: "ses_main",
+    processId: "process-1",
+    pid: process.pid,
+    sessionId: "ses_main",
+    parentSessionId: null,
+    title: "main session",
+    name: "worker",
+    hostname: "h",
+    directory: "/tmp/v2",
+    status: "idle",
+    transport: { type: "unix", path: "/tmp/v2.sock" },
+    serverUrl: "",
+    inboxUrl: "http+unix://v2",
+    inboxToken: "token",
+    capabilities: ["local", "protocol-v2", "prompt-async", "ack", "raw-session-ids"],
+    timestamps: { startedAt: NOW - 60_000, updatedAt: NOW - 30_000, heartbeatAt: NOW },
+    policy: { inboundPolicy: "accept", peerPermissions: "allow" },
+    pluginVersion: "0.3.0",
+    activeSessionId: "ses_main",
+    activeSessionTitle: "main session",
+    busy: false,
+    queuedCount: 0,
+    inboundPolicy: "accept",
+    startedAt: NOW - 60_000,
+    heartbeatAt: NOW,
+    ...over,
+  }
+}
+
+test("formatPeerList labels the scope and renders one role-tagged row per endpoint", () => {
+  const peers = [
+    { entry: v2Entry(), alive: true, staleReason: null },
+    { entry: v2Entry({
+      endpointId: "ses_child",
+      sessionId: "ses_child",
+      parentSessionId: "ses_main",
+      timestamps: { startedAt: NOW - 5_000, updatedAt: NOW - 1_000, heartbeatAt: NOW },
+    }), alive: true, staleReason: null },
+    { entry: v2Entry({ endpointId: "ses_dead" }), alive: false, staleReason: "last heartbeat 90s ago" },
+    { entry: peerEntry(), alive: true, staleReason: null }, // v1 peers are always "main"
+  ]
+  const machineWide = formatPeerList(peers, "alpha", "ses_self")
+  assert.match(machineWide, /3 peer\(s\) online \(scope: machine-wide\):/)
+  const rows = machineWide.split("\n")
+  // most recently active first: ses_child (1s ago) before ses_main (30s ago)
+  assert.ok(
+    machineWide.indexOf("(id ses_child)") < machineWide.indexOf("(id ses_main)"),
+    machineWide
+  )
+  const childRow = rows.find((l) => l.includes("ses_child"))
+  assert.match(childRow, /— subagent —/)
+  assert.ok(!childRow.includes("— main —"))
+  assert.match(machineWide, /— main —/) // v1 and parented v2 rows
+  assert.match(machineWide, /1 peer\(s\) stale\/offline/)
+
+  // formatPeerList only labels the scope; list_agents does the filtering,
+  // so an out-of-scope (already filtered) peer set renders the empty scoped state
+  const scoped = formatPeerList([], "alpha", "ses_self", "D:/x")
+  assert.match(scoped, /No peers online \(scope: directory D:\/x\)\./)
+})
+
+test("list_agents scopes by directory and project_only with case/slash-insensitive matching", async () => {
+  const listed = [
+    { entry: v2Entry({ name: "inscope", directory: "d:\\PROJ\\Root" }), alive: true, staleReason: null },
+    { entry: v2Entry({ name: "elsewhere", endpointId: "ses_other", sessionId: "ses_other", directory: "/tmp/other" }), alive: true, staleReason: null },
+  ]
+  const { tools } = makeTools({ listed, over: {
+    endpointForSession: (id) => id === "ses-self"
+      ? { endpointId: "ses_self", name: "alpha", directory: "D:/proj/root" }
+      : null,
+  } })
+
+  const byDir = await tools.list_agents.execute({ directory: "D:\\proj\\ROOT" }, { sessionID: "ses-self" })
+  assert.match(byDir, /1 peer\(s\) online \(scope: directory D:\\proj\\ROOT\):/)
+  assert.match(byDir, /"inscope"/)
+  assert.doesNotMatch(byDir, /elsewhere/)
+
+  const byProject = await tools.list_agents.execute({ project_only: true }, { sessionID: "ses-self" })
+  assert.match(byProject, /1 peer\(s\) online \(scope: directory D:\/proj\/root\):/)
+  assert.match(byProject, /"inscope"/)
+  assert.doesNotMatch(byProject, /elsewhere/)
+
+  const machineWide = await tools.list_agents.execute({}, { sessionID: "ses-self" })
+  assert.match(machineWide, /2 peer\(s\) online \(scope: machine-wide\):/)
+})
+
+test("list_agents project_only errors when the session has no registered directory", async () => {
+  const listed = [{ entry: v2Entry(), alive: true, staleReason: null }]
+  const { tools } = makeTools({ listed, over: { endpointForSession: () => null } })
+  const out = await tools.list_agents.execute({ project_only: true }, { sessionID: "ses-anon" })
+  assert.match(out, /not registered yet; pass an explicit directory/)
+  const explicit = await tools.list_agents.execute(
+    { project_only: true, directory: "/tmp/v2" },
+    { sessionID: "ses-anon" }
+  )
+  assert.match(explicit, /1 peer\(s\) online \(scope: directory \/tmp\/v2\):/)
+})
+
 test("send_message rejects empty and oversized messages", async () => {
   const { tools, sender } = makeTools({ listed: [{ entry: peerEntry(), alive: true }] })
   assert.match(await tools.send_message.execute({ to: "beta", message: "  " }, {}), /must not be empty/)
@@ -105,6 +208,20 @@ test("send_message resolves by name and by instanceId", async () => {
   const r2 = await tools.send_message.execute({ to: "bbbb2222", message: "hi" }, {})
   assert.match(r2, /delivered/)
   assert.equal(sender.calls.length, 2)
+})
+
+test("send_message also resolves v2 entries by raw sessionId", async () => {
+  const listed = [{
+    // a legacy-shape v2 endpoint whose endpointId is not its raw session id
+    entry: v2Entry({ endpointId: "session-oldhash", sessionId: "ses_target" }),
+    alive: true,
+    staleReason: null,
+  }]
+  const { tools, sender } = makeTools({ listed })
+  const out = await tools.send_message.execute({ to: "ses_target", message: "hi" }, {})
+  assert.match(out, /delivered/)
+  assert.equal(sender.calls.length, 1)
+  assert.equal(sender.calls[0].entry.endpointId, "session-oldhash")
 })
 
 test("send_message gives canonical v2 endpointId precedence without a v1 instanceId alias", async () => {
@@ -167,6 +284,7 @@ test("send_message reports unknown, offline and ambiguous targets", async () => 
   const ambiguous = await tools.send_message.execute({ to: "dup", message: "hi" }, {})
   assert.match(ambiguous, /ambiguous/)
   assert.match(ambiguous, /c1.*c2/s)
+  assert.match(ambiguous, /Use an endpoint id/i)
   assert.equal(sender.calls.length, 0)
 })
 

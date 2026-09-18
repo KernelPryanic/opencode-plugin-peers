@@ -10,7 +10,7 @@ import type { ListedPeer, RegistryInstance } from "../registry.js"
 import type { Sender } from "../sender.js"
 import type { RateLimiter } from "../queue.js"
 import type { OutboxInstance } from "../outbox.js"
-import { collapseToProcesses, sortPeers } from "../format.js"
+import { sameDirectory, sortPeers } from "../format.js"
 
 export interface ToolsDeps {
   registry: RegistryInstance
@@ -28,25 +28,32 @@ function entryId(entry: ListedPeer["entry"]): string {
 }
 
 function isEndpointShaped(target: string): boolean {
-  return /^(?:session|workspace)-[A-Za-z0-9][A-Za-z0-9_-]*$/.test(target)
+  return /^(?:ses_|session-|workspace-)[A-Za-z0-9][A-Za-z0-9_-]*$/.test(target)
 }
 
-export function formatPeerList(peers: ListedPeer[], selfName: string, selfId: string): string {
-  const online = sortPeers(collapseToProcesses(peers.filter((p) => p.alive)))
-  const offline = sortPeers(collapseToProcesses(peers.filter((p) => !p.alive)))
+export function formatPeerList(
+  peers: ListedPeer[],
+  selfName: string,
+  selfId: string,
+  scopeDirectory?: string | null
+): string {
+  const online = sortPeers(peers.filter((p) => p.alive))
+  const offline = sortPeers(peers.filter((p) => !p.alive))
+  const scopeLabel = scopeDirectory ? ` (scope: directory ${scopeDirectory})` : " (scope: machine-wide)"
   const lines: string[] = []
   if (online.length === 0) {
-    lines.push("No peers online.")
+    lines.push(`No peers online${scopeLabel}.`)
   } else {
-    lines.push(`${online.length} peer(s) online:`)
+    lines.push(`${online.length} peer(s) online${scopeLabel}:`)
     for (const p of online) {
       const e = p.entry
       const id = entryId(e)
+      const role = e.version === 2 && e.parentSessionId ? "subagent" : "main"
       const session = e.activeSessionId
         ? `session ${e.activeSessionTitle ? `"${e.activeSessionTitle}" ` : ""}(${e.activeSessionId})`
         : "(no active session)"
       lines.push(
-        `- "${e.name}" (id ${id}) — ${e.directory} — ${session} — inbound: ${e.inboundPolicy}`
+        `- "${e.name}" (id ${id}) — ${role} — ${e.directory} — ${session} — inbound: ${e.inboundPolicy}`
       )
     }
   }
@@ -80,12 +87,20 @@ export function buildPeerTools(deps: ToolsDeps): Record<string, ToolDefinition> 
 
     list_agents: tool({
       description:
-        "List other opencode session endpoints on this machine that you can exchange plain-text messages with. Shows each endpoint's name, id, directory, session and inbound policy.",
+        "List other opencode session endpoints on this machine that you can exchange plain-text messages with. Machine-wide by default; set project_only or directory to narrow the listing. Shows each endpoint's name, endpoint id (ses_...), role (main/subagent), directory, session, and inbound policy.",
       args: {
         include_offline: z
           .boolean()
           .optional()
           .describe("Also list stale/offline registry entries (default false)"),
+        project_only: z
+          .boolean()
+          .optional()
+          .describe("Restrict the listing to peers in this session's own project directory"),
+        directory: z
+          .string()
+          .optional()
+          .describe("Restrict the listing to peers in this exact directory (slash-insensitive; case-insensitive only on Windows/macOS)"),
       },
       async execute(args, context) {
         let peers: ListedPeer[]
@@ -96,9 +111,15 @@ export function buildPeerTools(deps: ToolsDeps): Record<string, ToolDefinition> 
         }
         const self = deps.endpointForSession?.(context.sessionID)
         const selfId = self?.endpointId ?? deps.selfInstanceId
+        const requestedDirectory = args.directory?.trim() || null
+        const scopeDirectory = requestedDirectory ?? (args.project_only ? self?.directory ?? null : null)
+        if (args.project_only && !requestedDirectory && !self?.directory) {
+          return "Error: this session is not registered yet; pass an explicit directory to scope the listing."
+        }
         const shown = (args.include_offline ? peers : peers.filter((p) => p.alive))
           .filter((peer) => entryId(peer.entry) !== selfId)
-        return formatPeerList(shown, self?.name ?? deps.selfName(), selfId)
+          .filter((peer) => !scopeDirectory || sameDirectory(peer.entry.directory, scopeDirectory))
+        return formatPeerList(shown, self?.name ?? deps.selfName(), selfId, scopeDirectory)
       },
     }),
 
@@ -106,7 +127,7 @@ export function buildPeerTools(deps: ToolsDeps): Record<string, ToolDefinition> 
       description:
         "Send a plain-text message immediately to an exact opencode session on this machine, including while it is busy. Text only — no files or conversation history. Resolve the target with list_agents first if unsure.",
       args: {
-        to: z.string().describe("Peer name or instanceId (see list_agents)"),
+        to: z.string().describe("Peer name, endpoint id (ses_...), or session id (see list_agents)"),
         message: z.string().describe("Plain-text message body"),
       },
       async execute(args, context) {
@@ -124,6 +145,7 @@ export function buildPeerTools(deps: ToolsDeps): Record<string, ToolDefinition> 
         const listed = await deps.registry.list()
         const target = args.to.trim()
         const knownExact = listed.find((peer) => entryId(peer.entry) === target)
+          ?? listed.find((peer) => peer.entry.version === 2 && peer.entry.sessionId === target)
         if (knownExact) {
           if (entryId(knownExact.entry) === selfId) {
             return `Error: cannot send a peer message to your own endpoint "${target}" in the same session.`
@@ -149,7 +171,7 @@ export function buildPeerTools(deps: ToolsDeps): Record<string, ToolDefinition> 
           const candidates = matches
             .map((p) => `"${p.entry.name}" (id ${entryId(p.entry)})`)
             .join(", ")
-          return `Error: "${target}" is ambiguous. Candidates: ${candidates}. Use an instanceId.`
+          return `Error: "${target}" is ambiguous. Candidates: ${candidates}. Use an endpoint id (ses_…).`
         }
 
         const peer = matches[0].entry

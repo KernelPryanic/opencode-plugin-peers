@@ -124,7 +124,7 @@ Use send_message to tell "backend" that the login form now posts to /v2/login.
 | `name` | `<dir>-<hex4>` | 其他对端用来寻址你的显示名；默认值在目录名后追加一个短十六进制后缀（取自实例 ID），使同目录的多个实例可以区分，与 Claude Code 的 `my-app-3f` 命名方式一致 |
 | `storageDir` | `$XDG_DATA_HOME/opencode-plugin-peers` | 注册表与待审收件箱的存储目录 |
 | `heartbeatMs` | `10000` | 注册表心跳间隔 |
-| `staleMs` | `30000` | 心跳早于该时长则视为对端离线 |
+| `staleMs` | `60000` | 心跳早于该时长则视为对端离线 |
 | `maxQueue` | `50` | 排队中（已接受、未投递）消息上限 |
 | `maxHeld` | `100` | 待审收件箱容量 |
 | `heldExpiryMs` | `300000` | 待审消息的批准时限；超时会产生一条最终 ACK |

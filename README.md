@@ -124,7 +124,7 @@ Options can be passed via the tuple form in `opencode.json`:
 | `name` | `<dir>-<hex4>` | display name other peers use to address you; the default appends a short hex suffix (from the instance ID) to the directory basename so same-directory instances are distinguishable, matching Claude Code's `my-app-3f` pattern |
 | `storageDir` | `$XDG_DATA_HOME/opencode-plugin-peers` | where the registry and held inbox live |
 | `heartbeatMs` | `10000` | registry heartbeat interval |
-| `staleMs` | `30000` | peer is offline if its heartbeat is older than this |
+| `staleMs` | `60000` | peer is offline if its heartbeat is older than this |
 | `maxQueue` | `50` | queued (accepted, undelivered) message cap |
 | `maxHeld` | `100` | held inbox cap |
 | `heldExpiryMs` | `300000` | held approval expiry; expiry produces a final ACK |

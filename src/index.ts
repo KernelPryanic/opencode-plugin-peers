@@ -37,7 +37,7 @@ import { handlePeersCommand } from "./commands.js"
 import { consumeCommand, createLogger, errorMessage } from "./feedback.js"
 import type { InboundPolicy, PluginConfig, ReceiveStatus } from "./types.js"
 
-const PLUGIN_VERSION = "0.2.2"
+const PLUGIN_VERSION = "0.3.0"
 const COMMAND_NAMES = new Set(["peers", "list-agents", "peers-name", "peers-inbox", "peers-outbox"])
 
 /**
@@ -408,7 +408,6 @@ export {
   createSessionMessageQueue,
   hasSpoolRecords,
   migrateWorkspaceSpool,
-  stableSessionEndpointId,
   stableSpoolEndpointId,
 } from "./queue.js"
 export { SessionTracker } from "./session-tracker.js"
@@ -426,6 +425,6 @@ export type {
 export { gateMessage } from "./gating.js"
 export { PeerPermissions, isProtectedPermission } from "./permissions.js"
 export { Outbox } from "./outbox.js"
-export { collapseToProcesses, formatSessionList, relativeAge, sortPeers } from "./format.js"
+export { formatSessionList, relativeAge, sortPeers } from "./format.js"
 export { resolveConfig, validateName } from "./config.js"
 export * from "./types.js"

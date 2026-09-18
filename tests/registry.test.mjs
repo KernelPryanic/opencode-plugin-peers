@@ -134,11 +134,29 @@ test("cleanupStale removes old dead-pid files only", async () => {
       startedAt: Date.now(), heartbeatAt: Date.now(), pluginVersion: "0.1.0",
     }))
 
+    // orphaned atomic-write temp files: aged + dead writer removed, but an
+    // aged temp owned by a live writer and a fresh temp both survive
+    const oldOrphanDead = join(dir, "deadpid.json.4242424.tmp")
+    await writeFile(oldOrphanDead, "{}")
+    await utimes(oldOrphanDead, past, past)
+    const oldOrphanPidless = join(dir, "crashed.tmp")
+    await writeFile(oldOrphanPidless, "{}")
+    await utimes(oldOrphanPidless, past, past)
+    const oldOrphanLive = join(dir, `livepid.json.${process.pid}.tmp`)
+    await writeFile(oldOrphanLive, "{}")
+    await utimes(oldOrphanLive, past, past)
+    const freshTmp = join(dir, `freshpid.json.${process.pid}.tmp`)
+    await writeFile(freshTmp, "{}")
+
     const removed = await reg.cleanupStale()
-    assert.equal(removed, 1)
+    assert.equal(removed, 3)
     const files = (await readdir(dir)).sort()
     assert.ok(files.includes("freshdead.json"))
     assert.ok(!files.includes("deadold.json"))
+    assert.ok(!files.includes("deadpid.json.4242424.tmp"))
+    assert.ok(!files.includes("crashed.tmp"))
+    assert.ok(files.includes(`livepid.json.${process.pid}.tmp`))
+    assert.ok(files.includes(`freshpid.json.${process.pid}.tmp`))
     await reg.stop()
   } finally {
     await rm(dir, { recursive: true, force: true })
@@ -200,7 +218,7 @@ test("v2 registry publishes one endpoint per session plus the most-recent v1 com
 
     const v2 = entries.filter(({ entry }) => entry.version === 2).map(({ entry }) => entry)
     assert.deepEqual(v2.map((entry) => entry.endpointId).sort(), ["session-alpha", "session-beta"])
-    assert.deepEqual(v2[0].capabilities, ["local", "protocol-v2", "prompt-async", "ack"])
+    assert.deepEqual(v2[0].capabilities, ["local", "protocol-v2", "prompt-async", "ack", "raw-session-ids"])
     assert.deepEqual(v2[0].policy, { inboundPolicy: "accept", peerPermissions: "allow" })
     assert.equal(v2[0].processId, "process-a")
     assert.equal(v2[0].transport.type, "unix")

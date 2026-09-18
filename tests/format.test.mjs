@@ -1,6 +1,6 @@
 import { test } from "node:test"
 import assert from "node:assert/strict"
-import { formatSessionList, relativeAge, collapseToProcesses } from "../dist/format.js"
+import { formatSessionList, relativeAge } from "../dist/format.js"
 
 const NOW = 1_800_000_000_000
 
@@ -50,14 +50,15 @@ test("formatSessionList renders Claude-Code-style rows", () => {
   )
   const lines = out.split("\n")
   assert.equal(lines[0], "Other Opencode sessions (2):")
-  // rows are sorted by startedAt ascending (deterministic across heartbeats)
+  // rows are sorted by most recent activity first; one row per endpoint with
+  // its endpoint key (v1: instanceId) before the started segment
   assert.equal(
     lines[1],
-    "  [idle]  ·  upstream-3a  ·  /Users/w/upstream  ·  started 29m ago"
+    "  [waiting]  ·  opencode-plugin-peers-0a  ·  /Users/w/opencode-plugin-peers  ·  aaaa1111  ·  started 9m ago"
   )
   assert.equal(
     lines[2],
-    "  [waiting]  ·  opencode-plugin-peers-0a  ·  /Users/w/opencode-plugin-peers  ·  started 9m ago"
+    "  [idle]  ·  upstream-3a  ·  /Users/w/upstream  ·  bbbb2222  ·  started 29m ago"
   )
 })
 
@@ -96,29 +97,69 @@ test("formatSessionList sorts online rows deterministically regardless of input 
   const a = peer({ entry: { ...peer().entry, name: "zed", instanceId: "zzz", startedAt: NOW - 1000 } })
   const b = peer({ entry: { ...peer().entry, name: "mid", instanceId: "mmm", startedAt: NOW - 5000 } })
   const c = peer({ entry: { ...peer().entry, name: "first", instanceId: "aaa", startedAt: NOW - 9000 } })
-  // same startedAt as c but a later id — must sort after c
+  // same startedAt as c but a later id — tiebreak is endpoint key ascending, so d sorts after c
   const d = peer({ entry: { ...peer().entry, name: "tiebreak", instanceId: "bbb", startedAt: NOW - 9000 } })
   const shuffled = [a, b, d, c]
   const one = formatSessionList(shuffled, NOW)
   const two = formatSessionList([c, d, b, a], NOW)
   assert.equal(one, two)
-  const order = [c, d, b, a].map((p) => p.entry.name)
+  // v1 rows sort by static startedAt, most recent activity first
+  const order = [a, b, c, d].map((p) => p.entry.name)
   const positions = order.map((name) => one.indexOf(`  [idle]  ·  ${name}`))
   assert.ok(positions.every((pos) => pos > 0), one)
   assert.deepEqual([...positions].sort((x, y) => x - y), positions)
 })
 
-test("collapseToProcesses keeps one row per process (newest session)", () => {
-  const proc = (endpointId, startedAt) => peer({}, { version: 2, endpointId, processId: "proc-a", startedAt })
-  const other = (endpointId, startedAt) => peer({}, { version: 2, endpointId, processId: "proc-b", startedAt })
+function v2Peer(over = {}) {
+  return peer(
+    {},
+    {
+      version: 2,
+      endpointId: "ses_main",
+      processId: "proc-1",
+      sessionId: "ses_main",
+      parentSessionId: null,
+      timestamps: { startedAt: NOW - 20 * 60_000, updatedAt: NOW - 30_000 },
+      ...over,
+    }
+  )
+}
 
-  const collapsed = collapseToProcesses([
-    proc("ep-old", NOW - 9000),
-    other("ep-other", NOW - 3000),
-    proc("ep-new", NOW - 1000),
-  ])
-  assert.equal(collapsed.length, 2)
-  assert.deepEqual(collapsed.map((p) => p.entry.endpointId).sort(), ["ep-new", "ep-other"])
+test("formatSessionList sorts v2 rows by timestamps.updatedAt, not startedAt", () => {
+  const freshSubagent = v2Peer({
+    endpointId: "ses_child",
+    sessionId: "ses_child",
+    parentSessionId: "ses_main",
+    timestamps: { startedAt: NOW - 2 * 60_000, updatedAt: NOW - 1000 },
+  })
+  const idleMain = v2Peer({}) // started later than the old main, updated earlier
+  const staleMain = v2Peer({
+    endpointId: "ses_old",
+    sessionId: "ses_old",
+    startedAt: NOW - 50 * 60_000,
+    timestamps: { startedAt: NOW - 50 * 60_000, updatedAt: NOW - 40 * 60_000 },
+  })
+  const out = formatSessionList([idleMain, staleMain, freshSubagent], NOW)
+  const rows = out.split("\n").filter((l) => l.startsWith("  "))
+  const keys = rows.map((l) => l.match(/·  (ses_\S+)  ·/)[1])
+  assert.deepEqual(keys, ["ses_child", "ses_main", "ses_old"])
+})
+
+test("formatSessionList shows one row per v2 endpoint with a [subagent] tag", () => {
+  const out = formatSessionList(
+    [
+      v2Peer({ endpointId: "ses_child", sessionId: "ses_child", parentSessionId: "ses_main" }),
+      v2Peer({ endpointId: "ses_main", sessionId: "ses_main" }),
+    ],
+    NOW
+  )
+  const rows = out.split("\n").filter((l) => l.startsWith("  "))
+  assert.equal(rows.length, 2) // no process collapsing
+  assert.match(rows[0], /\[subagent\]  ·/)
+  assert.ok(!rows[1].includes("[subagent]"))
+  // endpoint key segment is the raw session endpoint id
+  assert.match(rows[0], /·  ses_child  ·/)
+  assert.match(rows[1], /·  ses_main  ·/)
 })
 
 test("formatSessionList shows session title between name and directory when present", () => {

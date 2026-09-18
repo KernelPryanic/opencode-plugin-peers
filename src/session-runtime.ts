@@ -6,10 +6,10 @@ import {
   createSessionMessageQueue,
   hasSpoolRecords,
   migrateWorkspaceSpool,
-  stableSessionEndpointId,
   type QueueInstance,
 } from "./queue.js"
 import type { RegistryEndpoint } from "./registry.js"
+import { sameDirectory } from "./format.js"
 import { SessionTracker, type SessionTrackerInstance } from "./session-tracker.js"
 import type { InboundMessage, InboundPolicy, Logger, PeerAcknowledgementV2, ReceiveStatus, SessionEndpointStatus } from "./types.js"
 
@@ -28,6 +28,8 @@ interface RuntimeEndpoint {
   endpointId: string
   status: SessionEndpointStatus
   updatedAt: number
+  /** True when adopted by the sweep as another process's session. */
+  foreign: boolean
   queue: QueueInstance
   delivery: DeliveryInstance
   tracker: SessionTrackerInstance
@@ -93,7 +95,11 @@ export function SessionRuntime(opts: SessionRuntimeOptions): SessionRuntimeInsta
     )[0] ?? null
   }
 
-  async function upsert(session: OpenCodeSession, status?: SessionEndpointStatus): Promise<RuntimeEndpoint> {
+  async function upsert(
+    session: OpenCodeSession,
+    status?: SessionEndpointStatus,
+    foreign = false
+  ): Promise<RuntimeEndpoint> {
     const current = endpoints.get(session.id)
     if (current) {
       current.session = session
@@ -108,9 +114,10 @@ export function SessionRuntime(opts: SessionRuntimeOptions): SessionRuntimeInsta
     tracker.noteIdle(session.id)
     const endpoint: RuntimeEndpoint = {
       session,
-      endpointId: stableSessionEndpointId(session.id),
+      endpointId: session.id,
       status: status ?? "idle",
       updatedAt: session.time.updated,
+      foreign,
       queue,
       tracker,
       delivery: undefined as unknown as DeliveryInstance,
@@ -163,6 +170,16 @@ export function SessionRuntime(opts: SessionRuntimeOptions): SessionRuntimeInsta
     }
   }
 
+  /**
+   * opencode replays historical sessions' events at startup; adopting them
+   * would flood the registry with dead endpoints. Only real, recent activity
+   * creates an endpoint — the same recency rule the sweep uses.
+   */
+  function staleHistory(session: OpenCodeSession): boolean {
+    return !endpoints.has(session.id) &&
+      session.time.updated < Date.now() - 2 * opts.config.staleMs
+  }
+
   async function findSession(sessionId: string): Promise<RuntimeEndpoint | null> {
     const known = endpoints.get(sessionId)
     if (known) return known
@@ -172,9 +189,83 @@ export function SessionRuntime(opts: SessionRuntimeOptions): SessionRuntimeInsta
         query: { directory: opts.directory },
       })
       const session = responseData<OpenCodeSession>(response)
-      return session ? upsert(session) : null
+      if (!session || staleHistory(session)) return null
+      return upsert(session)
     } catch {
       return null
+    }
+  }
+
+  function retireable(endpoint: RuntimeEndpoint, session: OpenCodeSession): boolean {
+    return endpoint.foreign &&
+      session.time.updated < Date.now() - 2 * opts.config.staleMs &&
+      endpoint.queue.size() === 0 &&
+      endpoint.queue.held().length === 0 &&
+      endpoint.queue.pendingAcknowledgements().length === 0
+  }
+
+  async function adoptRecentSessions(): Promise<void> {
+    try {
+      const [listedResponse, statusResponse] = await Promise.all([
+        opts.client.session.list({ query: { directory: opts.directory } }),
+        opts.client.session.status({ query: { directory: opts.directory } }),
+      ])
+      const sessions = responseData<OpenCodeSession[]>(listedResponse) ?? []
+      const statuses = responseData<Record<string, unknown>>(statusResponse) ?? {}
+      const cutoff = Date.now() - 2 * opts.config.staleMs
+      const seen = new Set<string>()
+      for (const session of sessions) {
+        const status = normalizeStatus(statuses[session.id])
+        const current = endpoints.get(session.id)
+        if (!current && status === "idle" && session.time.updated < cutoff) continue
+        if (current && status === "idle" && retireable(current, session)) {
+          endpoints.delete(session.id)
+          continue
+        }
+        seen.add(session.id)
+        const endpoint = current ?? (await upsert(session, status, true))
+        if (!current) await endpoint.delivery.flush()
+        if (endpoint.status !== status) setStatus(endpoint, status)
+      }
+      // session.list returns roots only; busy subagents appear solely in the
+      // status snapshot and must not be idled out (or missed) below.
+      for (const [sessionId, raw] of Object.entries(statuses)) {
+        const status = normalizeStatus(raw)
+        if (status === "idle") continue
+        seen.add(sessionId)
+        const current = endpoints.get(sessionId)
+        if (current) {
+          if (current.status !== status) setStatus(current, status)
+          continue
+        }
+        try {
+          const response = await opts.client.session.get({
+            path: { id: sessionId },
+            query: { directory: opts.directory },
+          })
+          const session = responseData<OpenCodeSession>(response)
+          if (session) {
+            const endpoint = await upsert(session, status, true)
+            await endpoint.delivery.flush()
+          }
+        } catch (err) {
+          await opts.logger("debug", "failed to fetch busy session for adoption", {
+            error: String(err),
+            sessionId,
+          })
+        }
+      }
+      for (const endpoint of [...endpoints.values()]) {
+        if (seen.has(endpoint.session.id)) continue
+        if (!sameDirectory(endpoint.session.directory || opts.directory, opts.directory)) continue
+        if (retireable(endpoint, endpoint.session)) {
+          endpoints.delete(endpoint.session.id)
+          continue
+        }
+        if (endpoint.status !== "idle") setStatus(endpoint, "idle")
+      }
+    } catch (err) {
+      await opts.logger("debug", "sweep session poll failed", { error: String(err) })
     }
   }
 
@@ -322,6 +413,7 @@ export function SessionRuntime(opts: SessionRuntimeOptions): SessionRuntimeInsta
         const info = properties.info as OpenCodeSession | undefined
         if (event.type === "session.created" || event.type === "session.updated") {
           if (!info?.id) return false
+          if (staleHistory(info)) return false
           await upsert(info)
           if (event.type === "session.created") await loadChildren(info)
           return true
@@ -371,6 +463,7 @@ export function SessionRuntime(opts: SessionRuntimeOptions): SessionRuntimeInsta
 
     sweep() {
       return whileRunning(undefined, async () => {
+        await adoptRecentSessions()
         for (const endpoint of endpoints.values()) {
           await endpoint.queue.expireHeld()
           await endpoint.delivery.flush()
